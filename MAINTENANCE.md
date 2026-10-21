@@ -3,14 +3,18 @@
 > 中性纪律：**本仓库公开**——代码、README、commit message、本文件里都不得出现
 > 具体业务品牌、域名、桶名。所有指向"我们自己的服务"的值只进 GitHub Secrets。
 
-## 它怎么跑
+## 它怎么跑（2026-10-22 二版：参照 wechat-windows-versions 的排他做法重做检测）
 
 - `.github/workflows/watch.yml`：每小时（第 17 分）+ 手动触发（可勾 force 全量重跑）。
-- `watcher.py` 五步：读 Scoop Extras 的 wechat manifest 拿版本与官方直链 →
-  与 `versions.json`（状态文件，跑完自动 commit 回仓库）比对 → 新版本才往下走：
-  下载 → `gh release create`（tag `v<版本>`，附件=原始安装包）→ 可选镜像 →
-  可选通知 → 写状态并 push。
-- 没有新版本时整轮只是一次 GET，分钟级消耗极小。
+- `watcher.py` 排他链：**刮官网 `pc.weixin.qq.com` 拿当前官方直链**（dldir1v6.qq.com/
+  weixin/Universal/Windows/...exe）→ **HEAD 拿 Last-Modified / Content-Length** →
+  与 `versions.json` 里记的上次值比对 → **没动就退出（每小时成本 = 1 GET + 1 HEAD，
+  零下载）**；动了才下载官方原包 → PE FileVersion 提取版本号 → Release（备注带
+  Source/SHA256/Size/PE 版本/Last-Modified）→ 可选镜像 → 可选通知 → 状态回写。
+- 版本号格式 `\d+(\.\d+){2,3}`（PE FileVersion，如 4.1.15.1000；市场版本 .56 时
+  PE 内部号可能是 .1000——**Release tag 用 PE 号**，与市场版本可能末段不同）。
+- 一版教训（已过时但留档）：dldir1.qq.com/weixin/Windows/* 不是 4.x 通道
+  （WeChatSetup.exe 是 3.x、无版本化路径）；4.x 官方在 **dldir1v6** + **Universal/Windows**。
 
 ## Secrets（仓库设置里配，值永不外泄）
 

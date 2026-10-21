@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Hourly watcher for official WeChat (Windows) releases.
 
-What it does when a new version shows up:
-  1. download the official installer (URL comes from the version manifest);
-  2. publish it as a GitHub Release (permanent archive, free hosting);
-  3. optionally mirror the file to your own object storage via a
+What it does each hour (exclusivity first -- an unchanged version costs one
+page GET + one HEAD and nothing else):
+  1. scrape the official site (pc.weixin.qq.com) for the current installer
+     link, HEAD the CDN for its Last-Modified / Content-Length;
+  2. compare against the last-seen values in versions.json -- unchanged
+     means done, zero download (same approach as the well-known
+     wechat-windows-versions archives);
+  3. changed means Tencent shipped: download the official installer, read
+     the version from its PE FileVersion resource, publish it as a GitHub
+     Release (notes carry source URL + SHA256 + size + Last-Modified);
+  4. optionally mirror the file to your own object storage via a
      signed-ticket endpoint you control (credentials never touch this repo,
      everything comes from repository Secrets);
-  4. optionally push a notification to a Feishu group bot;
-  5. record the new version in versions.json and commit it back.
+  5. optionally push a notification to a Feishu group bot;
+  6. record the new state in versions.json and commit it back.
 
 Everything is config-driven: point the Secrets at your own endpoints and the
 same code works for anyone. Installers themselves belong to Tencent.
-
-Version source: the Scoop Extras "wechat" manifest -- community maintained,
-always points at the official download URLs.
 """
 
 import base64
@@ -30,58 +34,49 @@ from pathlib import Path
 
 import requests
 
-MANIFEST_URL = "https://raw.githubusercontent.com/ScoopInstaller/Extras/master/bucket/wechat.json"
+OFFICIAL_PAGE = "https://pc.weixin.qq.com/"  # official site carries the current 4.x download link
+LINK_RE = r"https://dldir1v6\.qq\.com/weixin/Universal/Windows/[^\s\"'<>,]+\.exe"
 STATE_FILE = Path("versions.json")
 DOWNLOAD_DIR = Path("downloads")
 RETRY = 3
 DOWNLOAD_TIMEOUT = 60 * 30  # big file, slow link: half an hour cap
-
-# Official CDN candidates, tried in order; the manifest URL is the last resort.
-# Note (learned the hard way, 2026-10-22): dldir1 has no versioned paths (404),
-# "WeChatSetup.exe" still serves the legacy 3.x line, and the 4.x installer is
-# "WeixinSetup.exe". Whatever the source, the PE FileVersion guard below decides.
-OFFICIAL_VERSIONED = "https://dldir1.qq.com/weixin/Windows/WeChatWin_{v}.exe"
-OFFICIAL_4X_LATEST = "https://dldir1.qq.com/weixin/Windows/WeixinSetup.exe"
-OFFICIAL_3X_LATEST = "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"
-
-
-def market_prefix(v: str) -> str:
-    """Market version = first three segments (4.1.15). The 4th segment in PE
-    FileVersion is an internal build number that does not follow the marketing
-    version (a 4.1.15.56 release carries FileVersion 4.1.15.1000)."""
-    parts = v.split(".")
-    return ".".join(parts[:3]) if len(parts) >= 3 else v
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def fetch_manifest() -> dict:
+def detect_official() -> dict:
+    """Scrape the official site for the current installer link, then HEAD it.
+
+    Change detection costs one page GET + one HEAD per hour: the CDN's
+    Last-Modified header only moves when Tencent ships a new build, so an
+    unchanged version never downloads anything (the exclusivity trick, same
+    approach as the well-known wechat-windows-versions archives).
+    """
     for i in range(RETRY):
         try:
-            r = requests.get(MANIFEST_URL, timeout=30)
-            r.raise_for_status()
-            m = r.json()
-            version = m["version"]
-            # download URL may sit at top level or under architecture.64bit
-            url = m.get("url") or ""
-            arch = (m.get("architecture") or {}).get("64bit") or {}
-            if arch.get("url"):
-                url = arch["url"]
-            if isinstance(url, list):
-                url = url[0]
-            if not url:
-                raise KeyError("url")
-            return {"version": version, "url": url.split("#")[0]}
+            page = requests.get(OFFICIAL_PAGE, timeout=30)
+            page.raise_for_status()
+            m = re.search(LINK_RE, page.text)
+            if not m:
+                raise RuntimeError("official download link not found on the page")
+            url = m.group(0)
+            h = requests.head(url, timeout=30, allow_redirects=True)
+            h.raise_for_status()
+            return {
+                "url": url,
+                "last_modified": h.headers.get("Last-Modified", ""),
+                "size": int(h.headers.get("Content-Length", 0) or 0),
+            }
         except Exception as e:  # noqa: BLE001 - want the full chain in logs
-            log(f"manifest fetch failed ({i + 1}/{RETRY}): {e}")
+            log(f"official detect failed ({i + 1}/{RETRY}): {e}")
             time.sleep(10 * (i + 1))
-    sys.exit("cannot read version manifest")
+    sys.exit("cannot detect official installer")
 
 
 def pe_file_version(path: Path) -> str:
-    """Read the FileVersion resource (e.g. 4.1.15.56) from a PE file.
+    """Read the FileVersion resource (e.g. 4.1.15.1000) from a PE file.
 
     Also usable standalone: `python watcher.py --pe-version <file>` -- handy
     when double-checking what some installer actually contains.
@@ -122,40 +117,30 @@ def fetch_to(url: str, dest: Path) -> None:
         raise RuntimeError(f"downloaded file too small: {dest.stat().st_size}")
 
 
-def download(version: str, manifest_url: str) -> tuple[Path, str]:
-    """Download the installer for exactly `version`.
+def download(url: str) -> tuple[Path, str]:
+    """Download the official installer, then read its PE FileVersion to learn
+    the version (the official link itself carries no version in its name).
 
-    Candidates in order: official versioned URL, official always-latest URL,
-    the manifest URL (community mirror). Whichever source wins, the PE
-    FileVersion must match `version` -- protects against the always-latest
-    endpoint lagging behind the manifest, and against repacked mirrors.
-    Stored under the WeChatWin_<version>.exe name (stable, versioned).
-    Returns (file, source_url) -- the source goes into the release notes.
+    Sanity guards: the file must be big enough and its PE version must be a
+    dotted-quad-ish number. Returns (file, version).
     """
     DOWNLOAD_DIR.mkdir(exist_ok=True)
-    dest = DOWNLOAD_DIR / f"WeChatWin_{version}.exe"
-    candidates = [
-        OFFICIAL_VERSIONED.format(v=version),
-        OFFICIAL_4X_LATEST,
-        OFFICIAL_3X_LATEST,
-        manifest_url,
-    ]
-    errors = []
-    for url in candidates:
-        for i in range(RETRY):
-            try:
-                log(f"downloading from {url} (try {i + 1})")
-                fetch_to(url, dest)
-                got = pe_file_version(dest)
-                if market_prefix(got) != market_prefix(version):
-                    raise RuntimeError(f"PE version mismatch: want {version}, file says {got!r} ({url})")
-                log(f"downloaded {dest.name} ({dest.stat().st_size >> 20} MB, PE version {got})")
-                return dest, url
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"{url}: {e}")
-                log(f"download failed ({i + 1}/{RETRY}): {e}")
-                time.sleep(15 * (i + 1))
-    sys.exit("all download candidates failed:\n" + "\n".join(errors))
+    tmp = DOWNLOAD_DIR / "official.exe"
+    for i in range(RETRY):
+        try:
+            log(f"downloading from {url} (try {i + 1})")
+            fetch_to(url, tmp)
+            version = pe_file_version(tmp)
+            if not re.fullmatch(r"\d+(\.\d+){2,3}", version or ""):
+                raise RuntimeError(f"no sane PE FileVersion in file: {version!r}")
+            dest = DOWNLOAD_DIR / f"WeChatWin_{version}.exe"
+            tmp.rename(dest)
+            log(f"downloaded {dest.name} ({dest.stat().st_size >> 20} MB, PE version {version})")
+            return dest, version
+        except Exception as e:  # noqa: BLE001
+            log(f"download failed ({i + 1}/{RETRY}): {e}")
+            time.sleep(15 * (i + 1))
+    sys.exit(f"cannot download installer from {url}")
 
 
 def sha256_of(path: Path) -> str:
@@ -166,26 +151,28 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def release_notes(path: Path, version: str, source_url: str) -> str:
+def release_notes(path: Path, version: str, source_url: str, last_modified: str) -> str:
     return (
         f"Official installer for WeChat {version}, archived automatically.\n"
         f"Source: {source_url}\n"
         f"SHA256: {sha256_of(path)}\n"
         f"Size: {path.stat().st_size} bytes\n"
         f"PE FileVersion: {pe_file_version(path)}\n"
+        f"Last Modified: {last_modified}\n"
     )
 
 
-def release(path: Path, version: str, source_url: str) -> str:
+def release(path: Path, version: str, source_url: str, last_modified: str = "") -> str:
     """Publish the installer as a GitHub Release. Returns the release URL.
 
-    Notes carry source URL + SHA256 + size + PE version (consumers -- and
-    downstream packaging -- verify against them). If the release already
-    exists (force rerun) the notes are refreshed, the asset is not re-uploaded.
+    Notes carry source URL + SHA256 + size + PE version + CDN Last-Modified
+    (consumers -- and downstream packaging -- verify against them). If the
+    release already exists (force rerun) the notes are refreshed, the asset
+    is not re-uploaded.
     """
     env = dict(os.environ)
     tag = f"v{version}"
-    notes = release_notes(path, version, source_url)
+    notes = release_notes(path, version, source_url, last_modified)
     run = lambda *args: subprocess.run(  # noqa: E731
         args, check=True, capture_output=True, text=True, env=env
     )
@@ -277,13 +264,17 @@ def notify(version: str, release_url: str, mirror_status: str) -> None:
         log(f"notify failed: {e}")
 
 
-def save_state(version: str, path: Path) -> None:
+def save_state(version: str, path: Path, detected: dict) -> None:
     state = {}
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     history = state.setdefault("history", [])
     history.append({"version": version, "file": path.name, "at": int(time.time())})
     state["latest"] = version
+    # 排他记账：官方 CDN 的 Last-Modified / Size——下一小时 HEAD 一比就知道有没有新版
+    state["last_modified"] = detected.get("last_modified", "")
+    state["size"] = detected.get("size", 0)
+    state["url"] = detected.get("url", "")
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -300,21 +291,27 @@ def main() -> None:
         print(pe_file_version(Path(sys.argv[2])) or "(no version resource found)")
         return
     force = os.environ.get("FORCE", "") == "1"
-    m = fetch_manifest()
-    version, url = m["version"], m["url"]
+    detected = detect_official()
     state = {}
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    if state.get("latest") == version and not force:
-        log(f"no change (latest={version})")
+    # 排他（exclusivity）：官方 CDN 的 Last-Modified 没动就不下载——
+    # 每小时成本 = 官网 1 GET + CDN 1 HEAD，零流量零下载。
+    unchanged = (
+        state.get("last_modified") == detected["last_modified"]
+        and state.get("url") == detected["url"]
+        and detected["last_modified"] != ""
+    )
+    if unchanged and not force:
+        log(f"no change (Last-Modified={detected['last_modified']}, latest={state.get('latest')})")
         return
-    log(f"new version detected: {version}")
-    path, source_url = download(version, url)
-    release_url = release(path, version, source_url)
+    log(f"change detected: Last-Modified={detected['last_modified']} size={detected['size']}")
+    path, version = download(detected["url"])
+    release_url = release(path, version, detected["url"], detected.get("last_modified", ""))
     mirror_status = mirror(path)
     log(f"mirror: {mirror_status}")
     notify(version, release_url, mirror_status)
-    save_state(version, path)
+    save_state(version, path, detected)
     commit_state(version)
     log("done")
 

@@ -8,14 +8,19 @@ object storage, and optionally pings a Feishu bot.
 每小时监测微信 Windows 官方新版本：下载官方安装包归档到 GitHub Releases，
 可选镜像到你自己的对象存储、推送飞书机器人通知。
 
-- **Version source**: the community [Scoop Extras](https://github.com/ScoopInstaller/Extras)
-  `wechat` manifest -- always points at official download URLs.
+- **Change detection (exclusivity)**: scrapes the official site for the
+  current installer link and HEADs the CDN -- when the `Last-Modified`
+  header has not moved, the run is over. An unchanged hour costs one page
+  GET + one HEAD, zero download.
+- **Version**: read from the installer's PE FileVersion resource after
+  download (the official link carries no version in its name).
 - **Archive**: every new version becomes a Release with the original,
-  unmodified installer attached.
+  unmodified installer attached; notes carry source URL, SHA256, size and
+  the CDN Last-Modified.
 - **No hardcoded backends**: mirror endpoint, auth header, token and webhook
   all come from repository Secrets -- point them at whatever you own.
 - **State**: `versions.json` (committed back by the workflow) remembers the
-  last seen version; an unchanged version costs a single HTTP GET.
+  last seen Last-Modified/URL and the version history.
 
 ## Setup
 
@@ -35,11 +40,15 @@ object storage, and optionally pings a Feishu bot.
 The hourly schedule needs no configuration. Runs that find no new version
 take well under a minute.
 
-## Why not just fetch the official site?
+## Why scrape the homepage instead of a version API?
 
-The official download page does not expose a stable version number. The Scoop
-manifest is maintained daily by a large community and pins the official URL
-for each release -- it is the most reliable public version signal.
+WeChat for Windows has no public version API. The official homepage always
+carries the current installer link, and the CDN answers HEAD with a moving
+`Last-Modified` -- together they are the cheapest reliable first-party
+signal (approach shared with the well-known wechat-windows-versions
+archives). The human version string is only needed once a change is
+confirmed, so it is read from the downloaded file's PE resources instead of
+guessing URLs.
 
 ## Legal
 
