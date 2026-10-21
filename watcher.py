@@ -210,7 +210,7 @@ def release(path: Path, version: str, source_url: str, last_modified: str = "", 
     """
     env = dict(os.environ)
     tag = f"v{version}"
-    notes = release_notes(path, version, source_url, last_modified)
+    notes = release_notes(path, version, source_url, last_modified, sha)
     run = lambda *args: subprocess.run(  # noqa: E731
         args, check=True, capture_output=True, text=True, env=env
     )
