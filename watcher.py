@@ -189,18 +189,18 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def release_notes(path: Path, version: str, source_url: str, last_modified: str) -> str:
+def release_notes(path: Path, version: str, source_url: str, last_modified: str, sha: str) -> str:
     return (
         f"Official installer for WeChat {version}, archived automatically.\n"
         f"Source: {source_url}\n"
-        f"SHA256: {sha256_of(path)}\n"
+        f"SHA256: {sha}\n"
         f"Size: {path.stat().st_size} bytes\n"
         f"PE FileVersion: {pe_file_version(path)}\n"
         f"Last Modified: {last_modified}\n"
     )
 
 
-def release(path: Path, version: str, source_url: str, last_modified: str = "") -> str:
+def release(path: Path, version: str, source_url: str, last_modified: str = "", sha: str = "") -> str:
     """Publish the installer as a GitHub Release. Returns the release URL.
 
     Notes carry source URL + SHA256 + size + PE version + CDN Last-Modified
@@ -230,19 +230,30 @@ def release(path: Path, version: str, source_url: str, last_modified: str = "") 
     return url
 
 
-def mirror(path: Path) -> str:
+def mirror(path: Path) -> tuple[str, str]:
     """Mirror the file to your own bucket via your own signed-ticket endpoint.
 
     Contract (all values from Secrets, nothing hardcoded):
       POST $UPLOAD_TICKET_URL   header { $UPLOAD_TOKEN_HEADER: $UPLOAD_TOKEN }
       body {"filename": "..."}  -> {"data": {"token", "key", "upload_url"}}
       then multipart POST to upload_url with fields token/key + file.
+
+    Tickets are single-key insert-only: an existing object is NEVER
+    overwritten (the storage answers "file exists") -- that rejection IS the
+    existence check, reported honestly instead of pre-checking. Returns
+    (status_text_chinese, public_url); url is empty when MIRROR_PUBLIC_BASE
+    is unset or nothing was uploaded.
     """
     endpoint = os.environ.get("UPLOAD_TICKET_URL", "")
     header = os.environ.get("UPLOAD_TOKEN_HEADER", "")
     token = os.environ.get("UPLOAD_TOKEN", "")
     if not (endpoint and header and token):
-        return "skipped (mirror not configured)"
+        return "未配置镜像", ""
+
+    def pub_url(key: str) -> str:
+        base = os.environ.get("MIRROR_PUBLIC_BASE", "").rstrip("/")
+        return f"{base}/{key}" if base and key else ""
+
     for i in range(RETRY):
         try:
             r = requests.post(
@@ -258,15 +269,20 @@ def mirror(path: Path) -> str:
                 files={"file": open(path, "rb")},
                 timeout=DOWNLOAD_TIMEOUT,
             )
+            text = up.text[:512]
+            # insert-only 同名不覆盖：七牛回 file exists（可能 2xx 带 error 体）。
+            # 不当失败——如实上报"已存在"，是否同包看通知里的 SHA256 比对。
+            if "file exists" in text or '"code":614' in text:
+                return "镜像同名已存在（不覆盖；若新包 SHA 不同需人工删旧重传）", pub_url(ticket["key"])
             up.raise_for_status()
             confirmed = up.json().get("key", "")
-            if confirmed and confirmed != ticket["key"]:
-                return f"failed (storage confirmed a different key: {confirmed})"
-            return "ok"
+            if confirmed != ticket["key"]:
+                raise RuntimeError(f"storage confirmed a different key: {confirmed!r}")
+            return "已上传镜像", pub_url(ticket["key"])
         except Exception as e:  # noqa: BLE001
             log(f"mirror failed ({i + 1}/{RETRY}): {e}")
             time.sleep(20 * (i + 1))
-    return "failed (see log above)"
+    return "镜像上传失败（见运行日志）", ""
 
 
 def feishu_sign(secret: str) -> tuple[str, dict]:
@@ -278,21 +294,20 @@ def feishu_sign(secret: str) -> tuple[str, dict]:
     return ts, {"timestamp": ts, "sign": sign}
 
 
-def notify(version: str, release_url: str, mirror_status: str) -> None:
+def notify(version: str, sha: str, release_url: str, mirror_status: str, mirror_url: str) -> None:
     webhook = os.environ.get("FEISHU_WEBHOOK", "")
     if not webhook:
         log("notify skipped (no webhook configured)")
         return
-    payload: dict = {
-        "msg_type": "text",
-        "content": {
-            "text": (
-                f"WeChat Windows new version: {version}\n"
-                f"Release: {release_url}\n"
-                f"Mirror: {mirror_status}"
-            )
-        },
-    }
+    lines = [
+        f"微信 Windows 新版本：{version}",
+        f"SHA256：{sha}",
+        f"下载（GitHub）：{release_url}",
+    ]
+    if mirror_url:
+        lines.append(f"下载（镜像）：{mirror_url}")
+    lines.append(f"镜像状态：{mirror_status}")
+    payload: dict = {"msg_type": "text", "content": {"text": "\n".join(lines)}}
     secret = os.environ.get("FEISHU_SECRET", "")
     if secret:
         ts, extra = feishu_sign(secret)
@@ -350,10 +365,11 @@ def main() -> None:
         return
     log(f"change detected: Last-Modified={detected['last_modified']} size={detected['size']}")
     path, version = download(detected["url"])
-    release_url = release(path, version, detected["url"], detected.get("last_modified", ""))
-    mirror_status = mirror(path)
-    log(f"mirror: {mirror_status}")
-    notify(version, release_url, mirror_status)
+    sha = sha256_of(path)  # 算一次全链复用（Release 备注与飞书通知同一份）
+    release_url = release(path, version, detected["url"], detected.get("last_modified", ""), sha)
+    mirror_status, mirror_url = mirror(path)
+    log(f"mirror: {mirror_status} {mirror_url}")
+    notify(version, sha, release_url, mirror_status, mirror_url)
     save_state(version, path, detected)
     commit_state(version)
     log("done")

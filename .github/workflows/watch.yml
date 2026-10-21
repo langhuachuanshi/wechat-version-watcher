@@ -39,6 +39,7 @@ jobs:
           UPLOAD_TICKET_URL: ${{ secrets.UPLOAD_TICKET_URL }}
           UPLOAD_TOKEN_HEADER: ${{ secrets.UPLOAD_TOKEN_HEADER }}
           UPLOAD_TOKEN: ${{ secrets.UPLOAD_TOKEN }}
+          MIRROR_PUBLIC_BASE: ${{ secrets.MIRROR_PUBLIC_BASE }}
           # Optional Feishu notification.
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
