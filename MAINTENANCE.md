@@ -11,8 +11,11 @@
   与 `versions.json` 里记的上次值比对 → **没动就退出（每小时成本 = 1 GET + 1 HEAD，
   零下载）**；动了才下载官方原包 → PE FileVersion 提取版本号 → Release（备注带
   Source/SHA256/Size/PE 版本/Last-Modified）→ 可选镜像 → 可选通知 → 状态回写。
-- 版本号格式 `\d+(\.\d+){2,3}`（PE FileVersion，如 4.1.15.1000；市场版本 .56 时
-  PE 内部号可能是 .1000——**Release tag 用 PE 号**，与市场版本可能末段不同）。
+- **版本号 = 市场版本**（如 4.1.15.56，与装机后 Weixin.dll 报的、适配链偏移表用的同口径）：
+  下载后 **7z 两层解包**读包内版本目录（参考仓同款做法；runner 预装 7z）。安装包自身
+  PE FileVersion 末段是内部 build 号（4.1.15.**56** 的包装着 4.1.15.**1000**）——PE 只做
+  合理性校验、写进 Release 备注，**不用来命名**（2026-10-22 二版定的口径，头版用 PE 号
+  归档过 v4.1.15.1000，已重归档为 v4.1.15.56 并清掉七牛错名对象）。
 - 一版教训（已过时但留档）：dldir1.qq.com/weixin/Windows/* 不是 4.x 通道
   （WeChatSetup.exe 是 3.x、无版本化路径）；4.x 官方在 **dldir1v6** + **Universal/Windows**。
 
