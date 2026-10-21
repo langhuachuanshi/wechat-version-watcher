@@ -238,11 +238,13 @@ def mirror(path: Path) -> tuple[str, str]:
       body {"filename": "..."}  -> {"data": {"token", "key", "upload_url"}}
       then multipart POST to upload_url with fields token/key + file.
 
-    Tickets are single-key insert-only: an existing object is NEVER
-    overwritten (the storage answers "file exists") -- that rejection IS the
-    existence check, reported honestly instead of pre-checking. Returns
-    (status_text_chinese, public_url); url is empty when MIRROR_PUBLIC_BASE
-    is unset or nothing was uploaded.
+    Same-key semantics: qiniu has DEPRECATED insertOnly -- a re-upload to the
+    same key overwrites (verified in practice). No pre-check needed: the
+    hourly exclusivity upstream means uploads only run when the official CDN
+    timestamp moved, and a new marketing version always carries a new name.
+    The "file exists" answer stays as a fallback in case anti-overwrite is
+    ever enabled on the bucket. Returns (status_text_chinese, public_url);
+    url is empty when MIRROR_PUBLIC_BASE is unset or nothing was uploaded.
     """
     endpoint = os.environ.get("UPLOAD_TICKET_URL", "")
     header = os.environ.get("UPLOAD_TOKEN_HEADER", "")
@@ -270,8 +272,8 @@ def mirror(path: Path) -> tuple[str, str]:
                 timeout=DOWNLOAD_TIMEOUT,
             )
             text = up.text[:512]
-            # insert-only 同名不覆盖：七牛回 file exists（可能 2xx 带 error 体）。
-            # 不当失败——如实上报"已存在"，是否同包看通知里的 SHA256 比对。
+            # 同名重传实测是覆盖（insertOnly 已废弃）；"file exists" 是桶端若开
+            # 防覆盖时的兜底识别——不当失败，如实上报并提示比对 SHA。
             if "file exists" in text or '"code":614' in text:
                 return "镜像同名已存在（不覆盖；若新包 SHA 不同需人工删旧重传）", pub_url(ticket["key"])
             up.raise_for_status()
