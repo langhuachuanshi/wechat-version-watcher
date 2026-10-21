@@ -27,6 +27,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -117,12 +118,47 @@ def fetch_to(url: str, dest: Path) -> None:
         raise RuntimeError(f"downloaded file too small: {dest.stat().st_size}")
 
 
-def download(url: str) -> tuple[Path, str]:
-    """Download the official installer, then read its PE FileVersion to learn
-    the version (the official link itself carries no version in its name).
+def extract_market_version(path: Path) -> str:
+    """Unpack the installer and read the marketing version (e.g. 4.1.15.56).
 
-    Sanity guards: the file must be big enough and its PE version must be a
-    dotted-quad-ish number. Returns (file, version).
+    The installer is a 7z self-extractor wrapping install.7z; inside sits a
+    version-named directory carrying the marketing version -- the same number
+    the installed WeChatWin.dll reports and downstream hook tables key on.
+    (The installer's own PE FileVersion ends in an internal build segment,
+    e.g. 4.1.15.1000, which does NOT follow the marketing version -- so PE is
+    only a sanity check, never the name.) Approach shared with the reference
+    archives; needs 7z on PATH (preinstalled on GitHub runners).
+    """
+    build = DOWNLOAD_DIR / "unpack"
+    if build.exists():
+        shutil.rmtree(build)
+    outer = build / "exe"
+    inner = build / "inner"
+    outer.mkdir(parents=True)
+    inner.mkdir(parents=True)
+    try:
+        subprocess.run(["7z", "x", str(path), f"-o{outer}", "-y"],
+                       check=True, capture_output=True)
+        archive = outer / "install.7z"
+        if not archive.exists():
+            raise RuntimeError("install.7z not found inside the installer")
+        subprocess.run(["7z", "x", str(archive), f"-o{inner}", "-y"],
+                       check=True, capture_output=True)
+        for p in sorted(inner.iterdir()):
+            if p.is_dir() and re.fullmatch(r"\d+(\.\d+)+", p.name):
+                return p.name
+        raise RuntimeError("no version-named directory inside install.7z")
+    finally:
+        if build.exists():
+            shutil.rmtree(build, ignore_errors=True)
+
+
+def download(url: str) -> tuple[Path, str]:
+    """Download the official installer and learn its marketing version.
+
+    Guards: the file must be big enough, its PE FileVersion must be a sane
+    dotted number, and the marketing version comes from unpacking (see
+    extract_market_version). Returns (file, marketing_version).
     """
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     tmp = DOWNLOAD_DIR / "official.exe"
@@ -130,12 +166,14 @@ def download(url: str) -> tuple[Path, str]:
         try:
             log(f"downloading from {url} (try {i + 1})")
             fetch_to(url, tmp)
-            version = pe_file_version(tmp)
-            if not re.fullmatch(r"\d+(\.\d+){2,3}", version or ""):
-                raise RuntimeError(f"no sane PE FileVersion in file: {version!r}")
+            pe = pe_file_version(tmp)
+            if not re.fullmatch(r"\d+(\.\d+){2,3}", pe or ""):
+                raise RuntimeError(f"no sane PE FileVersion in file: {pe!r}")
+            version = extract_market_version(tmp)
             dest = DOWNLOAD_DIR / f"WeChatWin_{version}.exe"
             tmp.rename(dest)
-            log(f"downloaded {dest.name} ({dest.stat().st_size >> 20} MB, PE version {version})")
+            log(f"downloaded {dest.name} ({dest.stat().st_size >> 20} MB, "
+                f"market {version}, PE FileVersion {pe})")
             return dest, version
         except Exception as e:  # noqa: BLE001
             log(f"download failed ({i + 1}/{RETRY}): {e}")
