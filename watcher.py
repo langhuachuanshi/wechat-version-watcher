@@ -37,8 +37,20 @@ RETRY = 3
 DOWNLOAD_TIMEOUT = 60 * 30  # big file, slow link: half an hour cap
 
 # Official CDN candidates, tried in order; the manifest URL is the last resort.
+# Note (learned the hard way, 2026-10-22): dldir1 has no versioned paths (404),
+# "WeChatSetup.exe" still serves the legacy 3.x line, and the 4.x installer is
+# "WeixinSetup.exe". Whatever the source, the PE FileVersion guard below decides.
 OFFICIAL_VERSIONED = "https://dldir1.qq.com/weixin/Windows/WeChatWin_{v}.exe"
-OFFICIAL_LATEST = "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"
+OFFICIAL_4X_LATEST = "https://dldir1.qq.com/weixin/Windows/WeixinSetup.exe"
+OFFICIAL_3X_LATEST = "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"
+
+
+def market_prefix(v: str) -> str:
+    """Market version = first three segments (4.1.15). The 4th segment in PE
+    FileVersion is an internal build number that does not follow the marketing
+    version (a 4.1.15.56 release carries FileVersion 4.1.15.1000)."""
+    parts = v.split(".")
+    return ".".join(parts[:3]) if len(parts) >= 3 else v
 
 
 def log(msg: str) -> None:
@@ -121,7 +133,12 @@ def download(version: str, manifest_url: str) -> Path:
     """
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     dest = DOWNLOAD_DIR / f"WeChatWin_{version}.exe"
-    candidates = [OFFICIAL_VERSIONED.format(v=version), OFFICIAL_LATEST, manifest_url]
+    candidates = [
+        OFFICIAL_VERSIONED.format(v=version),
+        OFFICIAL_4X_LATEST,
+        OFFICIAL_3X_LATEST,
+        manifest_url,
+    ]
     errors = []
     for url in candidates:
         for i in range(RETRY):
@@ -129,7 +146,7 @@ def download(version: str, manifest_url: str) -> Path:
                 log(f"downloading from {url} (try {i + 1})")
                 fetch_to(url, dest)
                 got = pe_file_version(dest)
-                if got != version:
+                if market_prefix(got) != market_prefix(version):
                     raise RuntimeError(f"PE version mismatch: want {version}, file says {got!r} ({url})")
                 log(f"downloaded {dest.name} ({dest.stat().st_size >> 20} MB, PE version {got})")
                 return dest
