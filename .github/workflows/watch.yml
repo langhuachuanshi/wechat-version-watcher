@@ -1,0 +1,49 @@
+name: watch
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly, off the top of the hour
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force a full run (re-download, re-notify)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # create releases + commit state file back
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests pefile
+
+      - name: Run watcher
+        env:
+          FORCE: ${{ inputs.force && '1' || '' }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # Optional mirror -- all three or none. Values live in repo Secrets.
+          UPLOAD_TICKET_URL: ${{ secrets.UPLOAD_TICKET_URL }}
+          UPLOAD_TOKEN_HEADER: ${{ secrets.UPLOAD_TOKEN_HEADER }}
+          UPLOAD_TOKEN: ${{ secrets.UPLOAD_TOKEN }}
+          # Optional Feishu notification.
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+        run: python watcher.py
+
+      - name: Clean up downloads
+        if: always()
+        run: rm -rf downloads
