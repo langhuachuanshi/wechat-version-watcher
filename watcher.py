@@ -232,8 +232,10 @@ def mirror(path: Path) -> str:
 
 
 def feishu_sign(secret: str) -> tuple[str, dict]:
+    # Feishu's scheme (official sample): the string "timestamp\nsecret" is the
+    # HMAC *key* with an empty message -- NOT key=secret (that yields 19021).
     ts = str(int(time.time()))
-    mac = hmac.new(secret.encode(), f"{ts}\n{secret}".encode(), hashlib.sha256).digest()
+    mac = hmac.new(f"{ts}\n{secret}".encode(), digestmod=hashlib.sha256).digest()
     sign = base64.b64encode(mac).decode()
     return ts, {"timestamp": ts, "sign": sign}
 
