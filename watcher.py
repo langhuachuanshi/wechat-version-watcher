@@ -256,7 +256,10 @@ def notify(version: str, release_url: str, mirror_status: str) -> None:
     secret = os.environ.get("FEISHU_SECRET", "")
     if secret:
         ts, extra = feishu_sign(secret)
-        webhook = f"{webhook}&timestamp={ts}&sign={extra['sign']}"
+        sep = "&" if "?" in webhook else "?"
+        # sign is base64: quote it, otherwise '+'/'=' get eaten by URL parsing
+        from urllib.parse import quote
+        webhook = f"{webhook}{sep}timestamp={ts}&sign={quote(extra['sign'])}"
     try:
         r = requests.post(webhook, json=payload, timeout=15)
         log(f"notify -> HTTP {r.status_code}: {r.text[:200]}")
