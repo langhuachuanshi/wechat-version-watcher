@@ -122,7 +122,7 @@ def fetch_to(url: str, dest: Path) -> None:
         raise RuntimeError(f"downloaded file too small: {dest.stat().st_size}")
 
 
-def download(version: str, manifest_url: str) -> Path:
+def download(version: str, manifest_url: str) -> tuple[Path, str]:
     """Download the installer for exactly `version`.
 
     Candidates in order: official versioned URL, official always-latest URL,
@@ -130,6 +130,7 @@ def download(version: str, manifest_url: str) -> Path:
     FileVersion must match `version` -- protects against the always-latest
     endpoint lagging behind the manifest, and against repacked mirrors.
     Stored under the WeChatWin_<version>.exe name (stable, versioned).
+    Returns (file, source_url) -- the source goes into the release notes.
     """
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     dest = DOWNLOAD_DIR / f"WeChatWin_{version}.exe"
@@ -149,7 +150,7 @@ def download(version: str, manifest_url: str) -> Path:
                 if market_prefix(got) != market_prefix(version):
                     raise RuntimeError(f"PE version mismatch: want {version}, file says {got!r} ({url})")
                 log(f"downloaded {dest.name} ({dest.stat().st_size >> 20} MB, PE version {got})")
-                return dest
+                return dest, url
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{url}: {e}")
                 log(f"download failed ({i + 1}/{RETRY}): {e}")
@@ -157,24 +158,48 @@ def download(version: str, manifest_url: str) -> Path:
     sys.exit("all download candidates failed:\n" + "\n".join(errors))
 
 
-def release(path: Path, version: str) -> str:
-    """Publish the installer as a GitHub Release. Returns the release URL."""
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def release_notes(path: Path, version: str, source_url: str) -> str:
+    return (
+        f"Official installer for WeChat {version}, archived automatically.\n"
+        f"Source: {source_url}\n"
+        f"SHA256: {sha256_of(path)}\n"
+        f"Size: {path.stat().st_size} bytes\n"
+        f"PE FileVersion: {pe_file_version(path)}\n"
+    )
+
+
+def release(path: Path, version: str, source_url: str) -> str:
+    """Publish the installer as a GitHub Release. Returns the release URL.
+
+    Notes carry source URL + SHA256 + size + PE version (consumers -- and
+    downstream packaging -- verify against them). If the release already
+    exists (force rerun) the notes are refreshed, the asset is not re-uploaded.
+    """
     env = dict(os.environ)
     tag = f"v{version}"
+    notes = release_notes(path, version, source_url)
     run = lambda *args: subprocess.run(  # noqa: E731
         args, check=True, capture_output=True, text=True, env=env
     )
     try:
-        existing = run("gh", "release", "view", tag, "--json", "url").stdout
-        url = json.loads(existing)["url"]
-        log(f"release {tag} already exists: {url}")
+        url = json.loads(run("gh", "release", "view", tag, "--json", "url").stdout)["url"]
+        log(f"release {tag} already exists: {url} (refreshing notes)")
+        run("gh", "release", "edit", tag, "--notes", notes)
         return url
     except subprocess.CalledProcessError:
         pass  # no such release yet - normal path
     out = run(
         "gh", "release", "create", tag, str(path),
         "--title", f"WeChat Windows {version}",
-        "--notes", f"Official installer for WeChat {version}, archived automatically.",
+        "--notes", notes,
     )
     url = out.stdout.strip().splitlines()[-1]
     return url
@@ -284,8 +309,8 @@ def main() -> None:
         log(f"no change (latest={version})")
         return
     log(f"new version detected: {version}")
-    path = download(version, url)
-    release_url = release(path, version)
+    path, source_url = download(version, url)
+    release_url = release(path, version, source_url)
     mirror_status = mirror(path)
     log(f"mirror: {mirror_status}")
     notify(version, release_url, mirror_status)
