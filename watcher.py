@@ -52,15 +52,15 @@ def fetch_manifest() -> dict:
             r.raise_for_status()
             m = r.json()
             version = m["version"]
-            url = m["url"]
-            if isinstance(url, list):
-                url = url[0]
-            # scoop manifests may carry the installer under architecture.64bit
+            # download URL may sit at top level or under architecture.64bit
+            url = m.get("url") or ""
             arch = (m.get("architecture") or {}).get("64bit") or {}
             if arch.get("url"):
                 url = arch["url"]
             if isinstance(url, list):
                 url = url[0]
+            if not url:
+                raise KeyError("url")
             return {"version": version, "url": url.split("#")[0]}
         except Exception as e:  # noqa: BLE001 - want the full chain in logs
             log(f"manifest fetch failed ({i + 1}/{RETRY}): {e}")
