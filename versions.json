@@ -1,5 +1,5 @@
 {
-  "latest": "4.2.0.12",
+  "latest": "4.2.0.13",
   "history": [
     {
       "version": "4.1.15.56",
@@ -65,9 +65,14 @@
       "version": "4.2.0.12",
       "file": "WeChatWin_4.2.0.12.exe",
       "at": 1793388366
+    },
+    {
+      "version": "4.2.0.13",
+      "file": "WeChatWin_4.2.0.13.exe",
+      "at": 1793916061
     }
   ],
-  "last_modified": "Fri, 30 Oct 2026 08:46:07 GMT",
-  "size": 259961968,
+  "last_modified": "Thu, 05 Nov 2026 03:19:28 GMT",
+  "size": 259969448,
   "url": "https://dldir1v6.qq.com/weixin/Universal/Windows/WeChatWin_4.2.0.exe"
 }
