@@ -20,7 +20,10 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    # watcher stages are budget-capped (download/mirror) and fail fast, so a
+    # run rarely needs more; a shorter cap also keeps a wedged run from
+    # hogging the concurrency queue and starving the hourly triggers
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 

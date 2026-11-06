@@ -20,17 +20,27 @@ optionally pings a Feishu bot.
 - **Archive**: every new version becomes a Release with the original,
   unmodified installer attached; notes carry source URL, SHA256, size, PE
   FileVersion and the CDN Last-Modified.
+- **State first**: the new state is committed (`track X`) immediately after
+  the Release is published and *before* any mirror work -- so a failed or
+  cancelled mirror can only cost a retry next hour, never a re-run of the
+  expensive download -> release pipeline.
 - **Mirror (optional)**: uploads to your own bucket through a signed
   single-key ticket endpoint you control (credentials never appear in this
-  repository). Note: qiniu has deprecated `insertOnly` -- a same-key
-  re-upload overwrites; the hourly exclusivity upstream makes that a
-  non-issue in normal operation.
+  repository). Transfers are fail-fast: a stalled stream aborts in ~2
+  minutes instead of blocking for half an hour. A failed upload leaves a
+  `mirror_pending` flag in the state; later runs self-heal by re-downloading
+  the asset from our own GitHub Release and re-uploading it (up to 10
+  automatic attempts, then a FORCE run is required). Note: qiniu has
+  deprecated `insertOnly` -- a same-key re-upload overwrites; the hourly
+  exclusivity upstream makes that a non-issue in normal operation.
 - **Notify (optional)**: sends a Feishu group-bot message in Chinese with
-  the version, SHA256, GitHub download link, mirror link and mirror status.
+  the version, SHA256, GitHub download link, mirror link and mirror status
+  (a healed mirror sends its own "补传" follow-up).
 - **No hardcoded backends**: every endpoint, token and webhook comes from
   repository Secrets -- point them at whatever you own.
 - **State**: `versions.json` (committed back by the workflow) remembers the
-  last seen Last-Modified/URL and the version history.
+  last seen Last-Modified/URL, the version history (capped at 100 entries)
+  and a `mirror_pending`/`mirror_attempts` pair while an upload is owed.
 
 ## Setup
 
