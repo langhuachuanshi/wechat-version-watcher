@@ -300,6 +300,29 @@ class V2Unavailable(Exception):
     """The ticket host doesn't expose qiniu's resumable v2 API."""
 
 
+def upload_host_candidates(upload_url: str) -> list[str]:
+    """Data-path host candidates for the v2 upload. The ticket's upload_url
+    names the bucket's source host (up-zN.qiniup.com), but a US runner
+    pushing a long stream to a mainland source gets zero cross-border ACK
+    throughput (2026-11-11: every part stalled the full 90 s with no
+    progress, while small requests to the same host succeeded) -- so try
+    qiniu's client-acceleration hosts first (upload-zN / the global smart
+    entry, geo-resolved to overseas edges that backhaul over qiniu's own
+    backbone), keeping the ticket host itself as the last resort."""
+    u = urlsplit(str(upload_url))
+    host = f"{u.scheme}://{u.netloc}"
+    cands: list[str] = []
+    m = re.fullmatch(r"up(-[a-z0-9]+)?\.qiniup\.com", u.netloc)
+    if m:
+        cands.append(f"{u.scheme}://upload{m.group(1) or ''}.qiniup.com")
+        smart = f"{u.scheme}://upload.qiniup.com"
+        if smart not in cands:
+            cands.append(smart)
+    if host not in cands:
+        cands.append(host)
+    return cands
+
+
 def bucket_from_upload_token(token: str) -> str:
     """Qiniu upload tokens are '<AK>:<sig>:<urlsafe-b64 policy JSON>'; the
     policy's scope ('bucket' or 'bucket:key') names the bucket that the
@@ -309,13 +332,14 @@ def bucket_from_upload_token(token: str) -> str:
     return str(policy["scope"]).split(":", 1)[0]
 
 
-def put_part(base: str, upload_id: str, n: int, blob: bytes, auth: dict) -> str:
+def put_part(base: str, upload_id: str, n: int, blob: bytes, auth: dict,
+             retries: int = RETRY) -> str:
     """PUT one 4 MiB part, retrying only this part. Fresh connection per
     call: short requests survive a degraded cross-border route where one
     long stream stalls. Returns the server etag for the complete call."""
     url = f"{base}/{upload_id}/{n}"
     last = ""
-    for i in range(RETRY):
+    for i in range(retries):
         try:
             r = requests.put(
                 url, data=blob,
@@ -326,7 +350,7 @@ def put_part(base: str, upload_id: str, n: int, blob: bytes, auth: dict) -> str:
             return str(r.json()["etag"])
         except Exception as e:  # noqa: BLE001
             last = str(e)
-            log(f"part {n} failed ({i + 1}/{RETRY}): {e}")
+            log(f"part {n} failed ({i + 1}/{retries}): {e}")
             time.sleep(5 * (i + 1))
     raise RuntimeError(f"part {n} kept failing: {last}")
 
@@ -361,7 +385,11 @@ def resumable_upload(host: str, token: str, key: str, path: Path) -> None:
     parts: list[dict] = []
     with open(path, "rb") as f:
         for n, blob in enumerate(iter(lambda: f.read(PART_SIZE), b""), 1):
-            parts.append({"partNumber": n, "etag": put_part(base, upload_id, n, blob, auth)})
+            # part 1 is the canary: one 90 s shot only, so a host whose route
+            # black-holes sustained writes is abandoned instead of burning
+            # three retries x 90 s before the next candidate host
+            parts.append({"partNumber": n, "etag": put_part(
+                base, upload_id, n, blob, auth, retries=1 if n == 1 else RETRY)})
             if n % 8 == 0 or n == total:
                 log(f"uploaded part {n}/{total} ({min(n * PART_SIZE, size) >> 20} MiB)")
     r = requests.post(f"{base}/{upload_id}", headers=auth, json={"parts": parts},
@@ -438,14 +466,26 @@ def mirror(path: Path) -> tuple[str, str, bool]:
         r.raise_for_status()
         body = r.json()
         ticket = body.get("data") or body
-        host = "{0.scheme}://{0.netloc}".format(urlsplit(str(ticket["upload_url"])))
-        try:
-            resumable_upload(host, str(ticket["token"]), str(ticket["key"]), path)
-            status = "已上传镜像"
-        except V2Unavailable as e:
-            log(f"resumable v2 unavailable ({e}); falling back to one-shot form upload")
+        key = str(ticket["key"])
+        candidates = upload_host_candidates(str(ticket["upload_url"]))
+        log(f"upload host candidates: {candidates}")
+        stalled: Exception | None = None
+        for host in candidates:
+            try:
+                log(f"trying resumable v2 via {host}")
+                resumable_upload(host, str(ticket["token"]), key, path)
+                log(f"uploaded via {host}")
+                return "已上传镜像", pub_url(key), True
+            except V2Unavailable as e:
+                log(f"resumable v2 unavailable on {host}: {e}")
+            except Exception as e:  # noqa: BLE001 - stalled/dead host: next one
+                stalled = e
+                log(f"upload via {host} failed: {e}")
+        if stalled is None:  # nobody speaks v2 -> the old single-shot path
+            log("falling back to one-shot form upload")
             status = form_upload(ticket, path)
-        return status, pub_url(str(ticket["key"])), True
+            return status, pub_url(key), True
+        raise stalled  # at least one host was reachable but stalled: retry stage
 
     got = retry("mirror", MIRROR_BUDGET_S, once)
     if got is None:
