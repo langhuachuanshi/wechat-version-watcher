@@ -2,6 +2,9 @@
 
 > 中性纪律：**本仓库公开**——代码、README、commit message、本文件里都不得出现
 > 具体业务品牌、域名、桶名。所有指向"我们自己的服务"的值只进 GitHub Secrets。
+> 注意 **Actions 日志同样公开**：`log()` 对七牛上传主机与签票端点统一打码
+> （`*.qiniup.com`→`(qiniup-host)`，端点→`(ticket-endpoint)`），镜像主机只以
+> `zone-acc`/`smart-entry`/`ticket-host` 标签出现——新增日志时别绕过 `log()`。
 
 ## 它怎么跑（2026-11-11 四版：先记账后镜像 + 镜像挂起自愈 + 分片续传上传）
 

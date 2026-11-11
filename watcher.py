@@ -72,7 +72,14 @@ T = TypeVar("T")
 
 
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    # CI logs on a public repo are world-readable: never let upload hosts or
+    # the ticket endpoint slip through -- requests embeds full URLs in many
+    # exception strings, so mask here as the safety net for every line
+    out = re.sub(r"\b(?:[a-z0-9-]+\.)*qiniup\.com\b", "(qiniup-host)", msg)
+    ep = os.environ.get("UPLOAD_TICKET_URL", "")
+    if ep:
+        out = out.replace(ep, "(ticket-endpoint)")
+    print(out, flush=True)
 
 
 def retry(stage: str, budget_s: int, attempt: Callable[[], T]) -> T | None:
@@ -300,26 +307,27 @@ class V2Unavailable(Exception):
     """The ticket host doesn't expose qiniu's resumable v2 API."""
 
 
-def upload_host_candidates(upload_url: str) -> list[str]:
-    """Data-path host candidates for the v2 upload. The ticket's upload_url
-    names the bucket's source host (up-zN.qiniup.com), but a US runner
-    pushing a long stream to a mainland source gets zero cross-border ACK
-    throughput (2026-11-11: every part stalled the full 90 s with no
-    progress, while small requests to the same host succeeded) -- so try
-    qiniu's client-acceleration hosts first (upload-zN / the global smart
+def upload_host_candidates(upload_url: str) -> list[tuple[str, str]]:
+    """Data-path host candidates for the v2 upload, as (label, url) pairs --
+    labels are what the public-safe logs show, urls never appear in them.
+    The ticket's upload_url names the bucket's source host (up-zN.qiniup.com),
+    but a US runner pushing a long stream to a mainland source gets zero
+    cross-border ACK throughput (2026-11-11: every part stalled the full 90 s
+    with no progress, while small requests to the same host succeeded) -- so
+    try qiniu's client-acceleration hosts first (upload-zN / the global smart
     entry, geo-resolved to overseas edges that backhaul over qiniu's own
     backbone), keeping the ticket host itself as the last resort."""
     u = urlsplit(str(upload_url))
     host = f"{u.scheme}://{u.netloc}"
-    cands: list[str] = []
+    cands: list[tuple[str, str]] = []
     m = re.fullmatch(r"up(-[a-z0-9]+)?\.qiniup\.com", u.netloc)
     if m:
-        cands.append(f"{u.scheme}://upload{m.group(1) or ''}.qiniup.com")
+        cands.append(("zone-acc", f"{u.scheme}://upload{m.group(1) or ''}.qiniup.com"))
         smart = f"{u.scheme}://upload.qiniup.com"
-        if smart not in cands:
-            cands.append(smart)
-    if host not in cands:
-        cands.append(host)
+        if smart not in [u for _, u in cands]:
+            cands.append(("smart-entry", smart))
+    if host not in [u for _, u in cands]:
+        cands.append(("ticket-host", host))
     return cands
 
 
@@ -468,19 +476,19 @@ def mirror(path: Path) -> tuple[str, str, bool]:
         ticket = body.get("data") or body
         key = str(ticket["key"])
         candidates = upload_host_candidates(str(ticket["upload_url"]))
-        log(f"upload host candidates: {candidates}")
+        log(f"upload host candidates: {', '.join(l for l, _ in candidates)}")
         stalled: Exception | None = None
-        for host in candidates:
+        for i, (label, host) in enumerate(candidates, 1):
             try:
-                log(f"trying resumable v2 via {host}")
+                log(f"trying resumable v2 host {i}/{len(candidates)} ({label})")
                 resumable_upload(host, str(ticket["token"]), key, path)
-                log(f"uploaded via {host}")
+                log(f"uploaded via host {i}/{len(candidates)} ({label})")
                 return "已上传镜像", pub_url(key), True
             except V2Unavailable as e:
-                log(f"resumable v2 unavailable on {host}: {e}")
+                log(f"resumable v2 unavailable on host {i} ({label}): {e}")
             except Exception as e:  # noqa: BLE001 - stalled/dead host: next one
                 stalled = e
-                log(f"upload via {host} failed: {e}")
+                log(f"upload via host {i} ({label}) failed: {e}")
         if stalled is None:  # nobody speaks v2 -> the old single-shot path
             log("falling back to one-shot form upload")
             status = form_upload(ticket, path)
