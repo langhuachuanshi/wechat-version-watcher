@@ -37,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Callable, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -57,7 +57,13 @@ QUIET_TIMEOUT = 120  # per-op cap for big transfers: a stalled stream aborts
 FETCH_BUDGET_S = 6 * 60  # wall-clock cap for one download attempt
 DOWNLOAD_BUDGET_S = RETRY * FETCH_BUDGET_S  # whole download stage
 DETECT_BUDGET_S = 3 * 60  # page GET + HEAD are quick; budget just bounds retries
-MIRROR_BUDGET_S = 12 * 60  # whole mirror stage (ticket + upload)
+MIRROR_BUDGET_S = 20 * 60  # whole mirror stage (ticket + upload); chunked
+#  parts at a degraded cross-border pace still fit inside the job's 40m cap
+PART_SIZE = 4 << 20  # qiniu resumable v2 parts: each must be 1MB..1GB
+PART_IO_TIMEOUT = 90  # per-part socket cap. On HTTPS, urllib3 leaves the
+#  *connect* slot's timeout on the socket while sending the body (the read
+#  value only arms once the response is read -- verified 2026-11-11), so both
+#  tuple elements must cover a whole part or writes abort at CONNECT_TIMEOUT
 MIRROR_AUTO_RETRIES = 10  # self-heal attempts per version before we stop
 #  burning bandwidth hourly and wait for a FORCE run
 HISTORY_CAP = 100  # keep versions.json from growing forever
@@ -290,20 +296,126 @@ def mirror_configured() -> bool:
     )
 
 
+class V2Unavailable(Exception):
+    """The ticket host doesn't expose qiniu's resumable v2 API."""
+
+
+def bucket_from_upload_token(token: str) -> str:
+    """Qiniu upload tokens are '<AK>:<sig>:<urlsafe-b64 policy JSON>'; the
+    policy's scope ('bucket' or 'bucket:key') names the bucket that the
+    resumable v2 paths need."""
+    policy_b64 = token.split(":")[2]
+    policy = json.loads(base64.urlsafe_b64decode(policy_b64 + "=" * (-len(policy_b64) % 4)))
+    return str(policy["scope"]).split(":", 1)[0]
+
+
+def put_part(base: str, upload_id: str, n: int, blob: bytes, auth: dict) -> str:
+    """PUT one 4 MiB part, retrying only this part. Fresh connection per
+    call: short requests survive a degraded cross-border route where one
+    long stream stalls. Returns the server etag for the complete call."""
+    url = f"{base}/{upload_id}/{n}"
+    last = ""
+    for i in range(RETRY):
+        try:
+            r = requests.put(
+                url, data=blob,
+                headers={**auth, "Content-Type": "application/octet-stream"},
+                timeout=(PART_IO_TIMEOUT, PART_IO_TIMEOUT),
+            )
+            r.raise_for_status()
+            return str(r.json()["etag"])
+        except Exception as e:  # noqa: BLE001
+            last = str(e)
+            log(f"part {n} failed ({i + 1}/{RETRY}): {e}")
+            time.sleep(5 * (i + 1))
+    raise RuntimeError(f"part {n} kept failing: {last}")
+
+
+def resumable_upload(host: str, token: str, key: str, path: Path) -> None:
+    """Qiniu resumable v2 upload: init -> 4 MiB part PUTs -> complete.
+
+    Why not one multipart POST (the pre-2026-11 path): the ticket host sits
+    across a border from the runner, and one ~260 MB stream stalls there
+    until the write aborts -- 4.2.0.52 died 9/9 attempts at ~15 s with zero
+    progress. Short per-part requests on fresh connections get through where
+    one long stream cannot, and a dead part costs a single 4 MiB retry
+    instead of the whole file."""
+    auth = {"Authorization": f"UpToken {token}"}
+    bucket = bucket_from_upload_token(token)
+    ek = base64.urlsafe_b64encode(key.encode()).decode()
+    base = f"{host}/buckets/{bucket}/objects/{ek}/uploads"
+
+    r = requests.post(base, headers=auth, timeout=(CONNECT_TIMEOUT, PAGE_TIMEOUT))
+    if r.status_code in (400, 404, 405):
+        raise V2Unavailable(f"init -> HTTP {r.status_code}: {r.text[:120]}")
+    r.raise_for_status()
+    try:
+        upload_id = r.json().get("uploadId", "")
+    except ValueError:
+        upload_id = ""
+    if not upload_id:
+        raise V2Unavailable(f"init gave no uploadId: {r.text[:120]}")
+
+    size = path.stat().st_size
+    total = (size + PART_SIZE - 1) // PART_SIZE
+    parts: list[dict] = []
+    with open(path, "rb") as f:
+        for n, blob in enumerate(iter(lambda: f.read(PART_SIZE), b""), 1):
+            parts.append({"partNumber": n, "etag": put_part(base, upload_id, n, blob, auth)})
+            if n % 8 == 0 or n == total:
+                log(f"uploaded part {n}/{total} ({min(n * PART_SIZE, size) >> 20} MiB)")
+    r = requests.post(f"{base}/{upload_id}", headers=auth, json={"parts": parts},
+                      timeout=(CONNECT_TIMEOUT, PAGE_TIMEOUT))
+    r.raise_for_status()
+    confirmed = r.json().get("key", "")
+    if confirmed != key:
+        raise RuntimeError(f"storage confirmed a different key: {confirmed!r}")
+
+
+def form_upload(ticket: dict, path: Path) -> str:
+    """One-shot multipart POST to upload_url -- the fallback for ticket hosts
+    that don't expose the resumable API. Same-key semantics: qiniu has
+    DEPRECATED insertOnly -- a re-upload to the same key overwrites (verified
+    in practice); no pre-check needed because the hourly exclusivity
+    upstream means a new marketing version always carries a new name. The
+    "file exists" answer stays as a fallback in case anti-overwrite is ever
+    enabled on the bucket. Returns the Chinese status text."""
+    with open(path, "rb") as f:
+        up = requests.post(
+            ticket["upload_url"],
+            data={"token": ticket["token"], "key": ticket["key"]},
+            files={"file": f},
+            timeout=(CONNECT_TIMEOUT, QUIET_TIMEOUT),
+        )
+    # qiniu form-upload errors come back as JSON ({"error", "code"}); fall
+    # back to sniffing the raw body when a proxy answers with plain text.
+    try:
+        reply: dict | None = up.json()
+    except ValueError:
+        reply = None
+    err = str(reply.get("error", "")) if isinstance(reply, dict) else up.text[:512]
+    code = reply.get("code") if isinstance(reply, dict) else None
+    # 同名重传实测是覆盖（insertOnly 已废弃）；"file exists" 是桶端若开
+    # 防覆盖时的兜底识别——不当失败，如实上报并提示比对 SHA。
+    if "file exists" in err.lower() or code == 614:
+        return "镜像同名已存在（不覆盖；若新包 SHA 不同需人工删旧重传）"
+    up.raise_for_status()
+    confirmed = reply.get("key", "") if isinstance(reply, dict) else ""
+    if confirmed != ticket["key"]:
+        raise RuntimeError(f"storage confirmed a different key: {confirmed!r}")
+    return "已上传镜像"
+
+
 def mirror(path: Path) -> tuple[str, str, bool]:
     """Mirror the file to your own bucket via your own signed-ticket endpoint.
 
     Contract (all values from Secrets, nothing hardcoded):
       POST $UPLOAD_TICKET_URL   header { $UPLOAD_TOKEN_HEADER: $UPLOAD_TOKEN }
       body {"filename": "..."}  -> {"data": {"token", "key", "upload_url"}}
-      then multipart POST to upload_url with fields token/key + file.
-
-    Same-key semantics: qiniu has DEPRECATED insertOnly -- a re-upload to the
-    same key overwrites (verified in practice). No pre-check needed: the
-    hourly exclusivity upstream means uploads only run when the official CDN
-    timestamp moved, and a new marketing version always carries a new name.
-    The "file exists" answer stays as a fallback in case anti-overwrite is
-    ever enabled on the bucket.
+      then qiniu resumable v2 part uploads against the ticket host's origin
+      (token + key + bucket-parsed-from-token are all the v2 API needs); a
+      one-shot multipart POST stays as the fallback for hosts that don't
+      speak v2.
 
     Returns (status_text_chinese, public_url, ok); the public url is empty
     when MIRROR_PUBLIC_BASE is unset or nothing was uploaded.
@@ -326,30 +438,14 @@ def mirror(path: Path) -> tuple[str, str, bool]:
         r.raise_for_status()
         body = r.json()
         ticket = body.get("data") or body
-        with open(path, "rb") as f:
-            up = requests.post(
-                ticket["upload_url"],
-                data={"token": ticket["token"], "key": ticket["key"]},
-                files={"file": f},
-                timeout=(CONNECT_TIMEOUT, QUIET_TIMEOUT),
-            )
-        # qiniu form-upload errors come back as JSON ({"error", "code"}); fall
-        # back to sniffing the raw body when a proxy answers with plain text.
+        host = "{0.scheme}://{0.netloc}".format(urlsplit(str(ticket["upload_url"])))
         try:
-            reply: dict | None = up.json()
-        except ValueError:
-            reply = None
-        err = str(reply.get("error", "")) if isinstance(reply, dict) else up.text[:512]
-        code = reply.get("code") if isinstance(reply, dict) else None
-        # 同名重传实测是覆盖（insertOnly 已废弃）；"file exists" 是桶端若开
-        # 防覆盖时的兜底识别——不当失败，如实上报并提示比对 SHA。
-        if "file exists" in err.lower() or code == 614:
-            return "镜像同名已存在（不覆盖；若新包 SHA 不同需人工删旧重传）", pub_url(ticket["key"]), True
-        up.raise_for_status()
-        confirmed = reply.get("key", "") if isinstance(reply, dict) else ""
-        if confirmed != ticket["key"]:
-            raise RuntimeError(f"storage confirmed a different key: {confirmed!r}")
-        return "已上传镜像", pub_url(ticket["key"]), True
+            resumable_upload(host, str(ticket["token"]), str(ticket["key"]), path)
+            status = "已上传镜像"
+        except V2Unavailable as e:
+            log(f"resumable v2 unavailable ({e}); falling back to one-shot form upload")
+            status = form_upload(ticket, path)
+        return status, pub_url(str(ticket["key"])), True
 
     got = retry("mirror", MIRROR_BUDGET_S, once)
     if got is None:
